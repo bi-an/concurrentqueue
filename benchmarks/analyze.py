@@ -12,8 +12,7 @@ for csv_file in csv_files:
     print(f"处理 CSV 文件: {csv_file}")
 
     # 读取 CSV
-    df = pd.read_csv(csv_file, skipinitialspace=True)
-    df.columns = [c.strip().rstrip(',') for c in df.columns]  # 清洗列名
+    df = pd.read_csv(csv_file, skipinitialspace=True, usecols=lambda col: not col.startswith('Unnamed')) # 跳过空列
 
     # 将 threads 转成字符串便于横坐标显示
     if 'threads' not in df.columns:
