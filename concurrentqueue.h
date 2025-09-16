@@ -1478,6 +1478,7 @@ private:
 			if (node->freeListRefs.fetch_add(SHOULD_BE_ON_FREELIST, std::memory_order_acq_rel) == 0) {
 				// Oh look! We were the last ones referencing this node, and we know
 				// we want to add it to the free list, so let's do it!
+				// 引用计数是状态标志：表示有多少线程正在操作该节点；当然，链表本身也持有一个节点的引用计数，否则无法判断节点是否在链表上
 				// 如果引用计数 was 0，所以我们是唯一持有该节点的线程
 		 		add_knowing_refcount_is_zero(node);
 			}
@@ -1492,8 +1493,8 @@ private:
 			while (head != nullptr) {
 				auto prevHead = head;
 				auto refs = head->freeListRefs.load(std::memory_order_relaxed);
-				// 如果 refs 为 0，说明节点已经不属于（至少不稳定）空闲链表；继续加载 freeListHead 并重试
-				// 如果 refs 不为 0，尝试将引用计数加 1
+				// 如果 refs 为 0，说明节点已经不属于（至少不稳定）空闲链表，有人已经将它取下了；继续加载 freeListHead 并重试
+				// 使用 CAS 来增加引用计数，也是为了防止节点已经被取下，我们却错误地增加它的引用计数（这会导致之后操作 head->next 是未定义行为）
 				if ((refs & REFS_MASK) == 0 || !head->freeListRefs.compare_exchange_strong(refs, refs + 1, std::memory_order_acquire)) {
 					head = freeListHead.load(std::memory_order_acquire);
 					continue;
@@ -1519,6 +1520,7 @@ private:
 					// Decrease refcount twice, once for our ref, and once for the list's ref
 					head->freeListRefs.fetch_sub(2, std::memory_order_release);
 					// 成功摘除时，没有将 head->next 设为 nullptr
+					// 这个 FreeList class 是 private 的，ConcurrentQueue 是它的唯一使用者
 					return head;
 				}
 
@@ -1563,13 +1565,15 @@ private:
 				// 将 node->next 设置为 head
 				// 此时的 head 不一定是 freeListHead 的最新值
 				node->freeListNext.store(head, std::memory_order_relaxed);
-				// 将 node 的引用计数置为 1 ；同时清除 SHOULD_BE_ON_FREELIST 位
+				// 将 node 的引用计数置为 1 （因为链表本身也要持有一个节点的引用计数）；
+				// 同时清除 SHOULD_BE_ON_FREELIST 位（已经将节点挂在链表上了）
 				node->freeListRefs.store(1, std::memory_order_release);
 				// 将 node 置为新的链表头
 				// 如果 head 不是 freeListHead 的最新值，则 CAS 失败，重新加载 freeListHead 并重试
+				// 虽然能保证我们是 node 的唯一持有者，但是 freeListHead 还是可能被其他线程修改
 				if (!freeListHead.compare_exchange_strong(head, node, std::memory_order_release, std::memory_order_relaxed)) {
 					// Hmm, the add failed, but we can only try again when the refcount goes back to zero
-					// 回退机制
+					// 回退机制：因为我们已经将引用计数加 1 了，所以其他线程现在可以操作该节点了，所以需要先回退，而不能直接重试
 					// -1 表示引用计数减去我们刚才加的 1
 					// +SHOULD_BE_ON_FREELIST 表示重新设置 SHOULD_BE_ON_FREELIST 位
 					if (node->freeListRefs.fetch_add(SHOULD_BE_ON_FREELIST - 1, std::memory_order_acq_rel) == 1) {
