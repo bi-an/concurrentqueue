@@ -1574,7 +1574,7 @@ private:
 				// 此时我们 try_get() 成功 → 使用 → add() → 把 node 的引用计数设为 1
 				// 此时，线程 X 继续往下执行，增加引用计数就会成功。
 				// 之后线程 X （它认为 head 就是 node）会获取 node->next，如果我们没有提前把 node->next 指向 head，就会是未定义的
-				// 如果线程 X 拿到 node->next （也就是链表实际的头）之后，freeListHead 已经不是 head 了，
+				// 如果线程 X 拿到 node->next （也就是链表实际的头）之后，freeListHead 已经不是 node 了，
 				// 它会 CAS 失败，然后回退，这是安全的
 				node->freeListRefs.store(1, std::memory_order_release);
 				// 将 node 置为新的链表头
