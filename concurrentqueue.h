@@ -1463,11 +1463,16 @@ private:
 			// We know that the should-be-on-freelist bit is 0 at this point, so it's safe to
 			// set it using a fetch_add
 			// 先将 SHOULD_BE_ON_FREELIST 置位
+			// SHOULD_BE_ON_FREELIST 位只有在 add() 的时候才会设置；
+			// 只有成功 try_get() 拿到节点的线程，才会调用 add() 来把节点加回 free list
+			// 所以我们是唯一调用 add() 的线程，设置 SHOULD_BE_ON_FREELIST 位是安全的
+			// 注：当然，try_get() 拿到节点的线程也可以安全地移交节点的所有权，
+			// 	比如生产者把该节点投入到生产成功的队列中去，然后消费者使用完毕后调用 add() 把节点加回 free list
+			// 	调用 add() 的线程不一定是同一个，但是该节点总是由一个线程在使用，所以设置 SHOULD_BE_ON_FREELIST 位总是安全的
 			if (node->freeListRefs.fetch_add(SHOULD_BE_ON_FREELIST, std::memory_order_acq_rel) == 0) {
 				// Oh look! We were the last ones referencing this node, and we know
 				// we want to add it to the free list, so let's do it!
-				// 如果引用计数为 0，说明没有线程在使用这个节点，可以直接添加到空闲列表
-				// “使用”指的是节点在生产-消费的工作队列中，或者正在被 try_get 取出
+				// 如果引用计数 was 0，所以我们是唯一持有该节点的线程
 		 		add_knowing_refcount_is_zero(node);
 			}
 		}
@@ -1481,20 +1486,29 @@ private:
 			while (head != nullptr) {
 				auto prevHead = head;
 				auto refs = head->freeListRefs.load(std::memory_order_relaxed);
+				// 如果 refs 为 0，说明节点已经不属于（至少不稳定）空闲链表；继续加载 freeListHead 并重试
+				// 如果 refs 不为 0，尝试将引用计数加 1
 				if ((refs & REFS_MASK) == 0 || !head->freeListRefs.compare_exchange_strong(refs, refs + 1, std::memory_order_acquire)) {
 					head = freeListHead.load(std::memory_order_acquire);
 					continue;
 				}
 
+				// 此时，refs > 0 且 head 的引用计数已经加 1
+				// 所以 refs 至少为 2
+				// 链表本身持有一个 node 的引用计数；我们尝试获取 node 时，又将引用计数加 1
+
 				// Good, reference count has been incremented (it wasn't at zero), which means we can read the
 				// next and not worry about it changing between now and the time we do the CAS
 				auto next = head->freeListNext.load(std::memory_order_relaxed);
-				// CAS 可能修改 head，所以我们提前存储到了 prevHead
+				// 如果 head 是 freeListHead 的最新值，则 CAS 成功，freeListHead 设为 next
 				// 如果 CAS 失败，head 获取到新的链表头，并重试
+				// CAS 可能修改 head（失败时），所以我们提前存储到了 prevHead
 				if (freeListHead.compare_exchange_strong(head, next, std::memory_order_acquire, std::memory_order_relaxed)) {
 					// Yay, got the node. This means it was on the list, which means shouldBeOnFreeList must be false no
 					// matter the refcount (because nobody else knows it's been taken off yet, it can't have been put back on).
 					assert((head->freeListRefs.load(std::memory_order_relaxed) & SHOULD_BE_ON_FREELIST) == 0);
+
+					// 我们成功将 freeListHead 设为 next ，所以其他线程 CAS 竞争失败，他们会在 if 外回退
 
 					// Decrease refcount twice, once for our ref, and once for the list's ref
 					head->freeListRefs.fetch_sub(2, std::memory_order_release);
@@ -1505,13 +1519,20 @@ private:
 				// OK, the head must have changed on us, but we still need to decrease the refcount we increased.
 				// Note that we don't need to release any memory effects, but we do need to ensure that the reference
 				// count decrement happens-after the CAS on the head.
-				// 回退机制
+				// CAS 竞争失败，回退
 				refs = prevHead->freeListRefs.fetch_sub(1, std::memory_order_acq_rel);
-				// 有线程尝试 add() 但是没有成功，只设置了 SHOULD_BE_ON_FREELIST 位
-				// 我们帮他把节点加到 free list 上
+				// 有线程尝试 add() 但是没有成功，因为我们也持有该节点
+				// 所以它只设置了 SHOULD_BE_ON_FREELIST 位
+				// 彼线程一定是成功 try_get() 的线程，它使用完毕后调用 add() 把节点加回 free list
+				// 注：这是一个有意思的事情，彼线程使用该节点时，我们还没能把它从 free list 上摘除（在我们最开始尝试时，它确实在 free list 上）
+				// 		现在这个节点都被使用完回来了 → ABA
+				// 现在我们是该节点的唯一所有者，只有我们能帮彼线程把节点加到 free list 上
 				if (refs == SHOULD_BE_ON_FREELIST + 1) {
 					add_knowing_refcount_is_zero(prevHead);
 				}
+
+				// 如果 CAS 竞争失败，我们获取到新的 head
+				// 如果新的 head != nullptr，说明链表不为空，还可以继续尝试获取
 			}
 
 			return nullptr;
@@ -1533,11 +1554,20 @@ private:
 			// the next thread who puts the refcount back at zero (which could be us, hence the loop).
 			auto head = freeListHead.load(std::memory_order_relaxed);
 			while (true) {
+				// 将 node->next 设置为 head
+				// 此时的 head 不一定是 freeListHead 的最新值
 				node->freeListNext.store(head, std::memory_order_relaxed);
+				// 将 node 的引用计数置为 1 ；同时清除 SHOULD_BE_ON_FREELIST 位
 				node->freeListRefs.store(1, std::memory_order_release);
+				// 将 node 置为新的链表头
+				// 如果 head 不是 freeListHead 的最新值，则 CAS 失败，重新加载 freeListHead 并重试
 				if (!freeListHead.compare_exchange_strong(head, node, std::memory_order_release, std::memory_order_relaxed)) {
 					// Hmm, the add failed, but we can only try again when the refcount goes back to zero
+					// 回退机制
+					// -1 表示引用计数减去我们刚才加的 1
+					// +SHOULD_BE_ON_FREELIST 表示重新设置 SHOULD_BE_ON_FREELIST 位
 					if (node->freeListRefs.fetch_add(SHOULD_BE_ON_FREELIST - 1, std::memory_order_acq_rel) == 1) {
+						// 如果引用计数变为 0，说明没有线程在使用这个节点，可以直接添加到空闲列表
 						continue;
 					}
 				}
