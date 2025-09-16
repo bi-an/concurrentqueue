@@ -1434,13 +1434,12 @@ private:
 	// Free list
 	///////////////////////////
 
-	template <typename N>
 	struct FreeListNode
 	{
 		FreeListNode() : freeListRefs(0), freeListNext(nullptr) { }
 
 		std::atomic<std::uint32_t> freeListRefs;
-		std::atomic<N*> freeListNext;
+		std::atomic<FreeListNode*> freeListNext;
 	};
 
 	// A simple CAS-based lock-free free list. Not the fastest thing in the world under heavy contention, but
@@ -1463,9 +1462,12 @@ private:
 #endif
 			// We know that the should-be-on-freelist bit is 0 at this point, so it's safe to
 			// set it using a fetch_add
+			// 先将 SHOULD_BE_ON_FREELIST 置位
 			if (node->freeListRefs.fetch_add(SHOULD_BE_ON_FREELIST, std::memory_order_acq_rel) == 0) {
 				// Oh look! We were the last ones referencing this node, and we know
 				// we want to add it to the free list, so let's do it!
+				// 如果引用计数为 0，说明没有线程在使用这个节点，可以直接添加到空闲列表
+				// “使用”指的是节点在生产-消费的工作队列中，或者正在被 try_get 取出
 		 		add_knowing_refcount_is_zero(node);
 			}
 		}
@@ -1487,6 +1489,8 @@ private:
 				// Good, reference count has been incremented (it wasn't at zero), which means we can read the
 				// next and not worry about it changing between now and the time we do the CAS
 				auto next = head->freeListNext.load(std::memory_order_relaxed);
+				// CAS 可能修改 head，所以我们提前存储到了 prevHead
+				// 如果 CAS 失败，head 获取到新的链表头，并重试
 				if (freeListHead.compare_exchange_strong(head, next, std::memory_order_acquire, std::memory_order_relaxed)) {
 					// Yay, got the node. This means it was on the list, which means shouldBeOnFreeList must be false no
 					// matter the refcount (because nobody else knows it's been taken off yet, it can't have been put back on).
@@ -1494,13 +1498,17 @@ private:
 
 					// Decrease refcount twice, once for our ref, and once for the list's ref
 					head->freeListRefs.fetch_sub(2, std::memory_order_release);
+					// 成功摘除时，没有将 head->next 设为 nullptr
 					return head;
 				}
 
 				// OK, the head must have changed on us, but we still need to decrease the refcount we increased.
 				// Note that we don't need to release any memory effects, but we do need to ensure that the reference
 				// count decrement happens-after the CAS on the head.
+				// 回退机制
 				refs = prevHead->freeListRefs.fetch_sub(1, std::memory_order_acq_rel);
+				// 有线程尝试 add() 但是没有成功，只设置了 SHOULD_BE_ON_FREELIST 位
+				// 我们帮他把节点加到 free list 上
 				if (refs == SHOULD_BE_ON_FREELIST + 1) {
 					add_knowing_refcount_is_zero(prevHead);
 				}
