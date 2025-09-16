@@ -1494,7 +1494,8 @@ private:
 				auto prevHead = head;
 				auto refs = head->freeListRefs.load(std::memory_order_relaxed);
 				// 如果 refs 为 0，说明节点已经不属于（至少不稳定）空闲链表，有人已经将它取下了；继续加载 freeListHead 并重试
-				// 使用 CAS 来增加引用计数，也是为了防止节点已经被取下，我们却错误地增加它的引用计数（这会导致之后操作 head->next 是未定义行为）
+				// 使用 CAS 来增加引用计数，也是为了防止 refs 已经为 0（节点已经被取下），
+				// 我们却错误地增加它的引用计数（这会导致之后操作 head->next 是未定义行为）
 				if ((refs & REFS_MASK) == 0 || !head->freeListRefs.compare_exchange_strong(refs, refs + 1, std::memory_order_acquire)) {
 					head = freeListHead.load(std::memory_order_acquire);
 					continue;
@@ -1567,17 +1568,26 @@ private:
 				node->freeListNext.store(head, std::memory_order_relaxed);
 				// 将 node 的引用计数置为 1 （因为链表本身也要持有一个节点的引用计数）；
 				// 同时清除 SHOULD_BE_ON_FREELIST 位（已经将节点挂在链表上了）
+				// 必须先把 node->next 设置为 head，再把引用计数设为 1
+				// 因为一旦将引用计数设为非 0 ，其他线程就可以操作该节点了
+				// 比如有线程（记作 X）与我们同时进入 try_get() ，拿到 head 和 head 的引用计数，还没有来得及增加引用计数；
+				// 此时我们 try_get() 成功 → 使用 → add() → 把 node 的引用计数设为 1
+				// 此时，线程 X 继续往下执行，增加引用计数就会成功。
+				// 之后线程 X （它认为 head 就是 node）会获取 node->next，如果我们没有提前把 node->next 指向 head，就会是未定义的
+				// TODO: 如果线程 X 获取的 node->next 已经被其他线程拿走了，可能吗？
 				node->freeListRefs.store(1, std::memory_order_release);
 				// 将 node 置为新的链表头
 				// 如果 head 不是 freeListHead 的最新值，则 CAS 失败，重新加载 freeListHead 并重试
-				// 虽然能保证我们是 node 的唯一持有者，但是 freeListHead 还是可能被其他线程修改
+				// 因为我们已经将引用计数加 1 了，所以其他线程现在可以操作该节点了
+				// 所以，我们不一定是 node 的唯一持有者了，需要放弃这种“唯一持有者”的假设
+				// 并且 freeListHead 也可能被其他线程修改
 				if (!freeListHead.compare_exchange_strong(head, node, std::memory_order_release, std::memory_order_relaxed)) {
 					// Hmm, the add failed, but we can only try again when the refcount goes back to zero
-					// 回退机制：因为我们已经将引用计数加 1 了，所以其他线程现在可以操作该节点了，所以需要先回退，而不能直接重试
+					// 回退机制：
 					// -1 表示引用计数减去我们刚才加的 1
 					// +SHOULD_BE_ON_FREELIST 表示重新设置 SHOULD_BE_ON_FREELIST 位
 					if (node->freeListRefs.fetch_add(SHOULD_BE_ON_FREELIST - 1, std::memory_order_acq_rel) == 1) {
-						// 如果引用计数变为 0，说明没有线程在使用这个节点，可以直接添加到空闲列表
+						// 如果引用计数变为 0，说明没有线程在使用这个节点，我们还是唯一的持有者
 						continue;
 					}
 				}
