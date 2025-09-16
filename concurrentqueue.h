@@ -1434,12 +1434,18 @@ private:
 	// Free list
 	///////////////////////////
 
+	// 这是一个不可直接例化的类，但是新类可以继承它，从而获得一个 freeListNode<self> 的 next 成员
+	// 这样做的目的是让 FreeListNode 的 next 指针指向正确的类型，而不是 FreeListNode 类型
+	// struct MyListNode : FreeListNode<MyListNode> { ... };
+	template<typename N>
 	struct FreeListNode
 	{
 		FreeListNode() : freeListRefs(0), freeListNext(nullptr) { }
 
 		std::atomic<std::uint32_t> freeListRefs;
-		std::atomic<FreeListNode*> freeListNext;
+		// 由于使用 N* 类型（而不是 FreeListNode* ）的 next
+		// 所以 FreeListNode 不可以直接例化
+		std::atomic<N*> freeListNext;
 	};
 
 	// A simple CAS-based lock-free free list. Not the fastest thing in the world under heavy contention, but
