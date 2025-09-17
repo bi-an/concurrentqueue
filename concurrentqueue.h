@@ -1480,7 +1480,7 @@ private:
 				// we want to add it to the free list, so let's do it!
 				// 引用计数是状态标志：表示有多少线程正在操作该节点；当然，链表本身也持有一个节点的引用计数，否则无法判断节点是否在链表上
 				// 如果引用计数 was 0，所以我们是唯一持有该节点的线程
-		 		add_knowing_refcount_is_zero(node);
+				add_knowing_refcount_is_zero(node);
 			}
 		}
 
