@@ -1561,6 +1561,7 @@ private:
 			// something non-zero, then the refcount increment is done by the other thread) -- so, if the CAS
 			// to add the node to the actual list fails, decrease the refcount and leave the add operation to
 			// the next thread who puts the refcount back at zero (which could be us, hence the loop).
+			// 这一步即使获取到最新值,接下来的步骤执行时也不能保证 head 还是新值了,所以使用 relaxed
 			auto head = freeListHead.load(std::memory_order_relaxed);
 			while (true) {
 				// 将 node->next 设置为 head
@@ -1573,22 +1574,32 @@ private:
 				// 比如有线程（记作 X）与我们同时进入 try_get() ，拿到 head 和 head 的引用计数，还没有来得及增加引用计数；
 				// 此时我们 try_get() 成功 → 使用 → add() → 把 node 的引用计数设为 1
 				// 此时，线程 X 继续往下执行，增加引用计数就会成功。
-				// 之后线程 X （它认为 head 就是 node）会获取 node->next，如果我们没有提前把 node->next 指向 head，就会是未定义的
+				// 之后线程 X （它认为 head 就是 node）会获取 node->next，如果我们没有提前把 node->next 指向 head，就会是未定义的 TODO: 是吗?
 				// 如果线程 X 拿到 node->next （也就是链表实际的头）之后，freeListHead 已经不是 node 了，
 				// 它会 CAS 失败，然后回退，这是安全的
+				// 简言之,node->next 是不是最新值不重要,重要的是,node->next 一定要指向一个实际的节点,不能是未定义的行为
+				// 在设置引用计数之前,我们是唯一的所有者,所以不需要 acquire
 				node->freeListRefs.store(1, std::memory_order_release);
 				// 将 node 置为新的链表头
 				// 如果 head 不是 freeListHead 的最新值，则 CAS 失败，重新加载 freeListHead 并重试
 				// 因为我们已经将引用计数加 1 了，所以其他线程现在可以操作该节点了
 				// 所以，我们不一定是 node 的唯一持有者了，需要放弃这种“唯一持有者”的假设
 				// 并且 freeListHead 也可能被其他线程修改
+				// 原子操作不受 memory order 的影响,所有的 memory order 都是为了同步其他线程的操作,
+				// 也就是说 CAS 即使使用 relaxed, 也不会影响 "比较 head 和 freeListHead" 和 "设置 freeListHead 为 head" 的正确性
+				// 这里我们使用 release 是为了让前面的对 node 的修改（next 和 refs）对其他线程可见;
+				// 使用 freeListHead.load(acquire) 的地方将与我们同步
 				if (!freeListHead.compare_exchange_strong(head, node, std::memory_order_release, std::memory_order_relaxed)) {
 					// Hmm, the add failed, but we can only try again when the refcount goes back to zero
 					// 回退机制：
 					// -1 表示引用计数减去我们刚才加的 1
 					// +SHOULD_BE_ON_FREELIST 表示重新设置 SHOULD_BE_ON_FREELIST 位
+					// release: 发布我们的写入
+					// acquire: 把别人的改动同步过来,我们之后会根据这些改动来决定要不要继续
+					// (比如我们重新循环的话,要用到 freeListHead, node->freeListRefs)
 					if (node->freeListRefs.fetch_add(SHOULD_BE_ON_FREELIST - 1, std::memory_order_acq_rel) == 1) {
-						// 如果引用计数变为 0，说明没有线程在使用这个节点，我们还是唯一的持有者
+						// 如果引用计数变为 0，说明没有线程在使用这个节点，我们还是唯一的持有者(至少在执行 fetch_add 之前)
+						// 现在 fetch_add 执行完了，只能说我们可能还是唯一的持有者
 						continue;
 					}
 				}
