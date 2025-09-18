@@ -22,6 +22,57 @@ $ readelf -l your_program | grep interpreter
 
 这个链接器负责在程序启动时加载所需的动态库，包括 libc.so.6（glibc 的主库）。
 
+注意：`ld.so`（这是一个简称）和 `ld` 完全不是一个东西，`ld` 是一个可执行程序，在编译期使用，见下文[编译时链接器（ld）](#编译时链接器（ld）)。
+
+- `ld.so` 既是 so 也是可执行文件：
+
+```bash
+$ file /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2: ELF 64-bit LSB shared object, x86-64, version 1 (GNU/Linux), dynamically linked, BuildID[sha1]=e4de036b19e4768e7591b596c4be9f9015f2d28a, stripped
+```
+
+普通程序的 ELF 文件中有一个 PT_INTERP 段，指定了这个链接器的路径。
+
+```bash
+$ file /usr/bin/ls
+/usr/bin/ls: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=36b86f957a1be53733633d184c3a3354f3fc7b12, for GNU/Linux 3.2.0, stripped
+
+$ file /lib/x86_64-linux-gnu/libc.so.6
+/lib/x86_64-linux-gnu/libc.so.6: ELF 64-bit LSB shared object, x86-64, version 1 (GNU/Linux), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=cd410b710f0f094c6832edd95931006d883af48e, for GNU/Linux 3.2.0, stripped
+```
+
+- 动态链接器 ld.so 本身也依赖共享库（如 libc.so.6），但它又是负责加载共享库的工具
+
+动态链接器是一个“自举”程序：
+- 它是由 Linux 内核直接加载并执行，不依赖其他库来启动。
+- 它的启动代码是 静态编译的，也就是说，它的最小启动逻辑不依赖 libc.so.6。
+- 在启动后，它才会去加载 libc.so.6 和其他 .so 文件，完成符号解析和初始化。
+- 有趣的是，libc.so.6 又依赖 ld.so 来加载。
+
+```
+你运行 ./myapp
+↓
+内核读取 ELF → 找到 PT_INTERP 段 → 加载 ld.so
+↓
+ld.so 启动（靠自身静态代码）
+↓
+ld.so 加载 libc.so.6、libstdc++.so.6 等共享库
+↓
+ld.so 跳转到 myapp 的入口地址（main）
+```
+
+
+如果 libc.so.6 丢失怎么办？
+
+有开发者分享过真实案例，当系统误删了 libc.so.6 ，几乎所有命令都无法运行。但你仍然可以：
+
+```bash
+/lib64/ld-linux-x86-64.so.2 /bin/ln -s /lib64/libc-2.33.so /lib64/libc.so.6
+```
+
+这利用了 ld.so 的自举能力，手动加载 libc 并执行命令，从而恢复系统。
+
+
 ### ldd 检查
 
 `ldd` (List Dynamic Dependencies) 是一个 shell 脚本，用于查看一个可执行文件或共享库所依赖的动态链接库的命令。
@@ -97,8 +148,7 @@ glibc 是特殊的 so ，它封装了系统调用，所以 Linux 系统本身也
 
 C 语言允许编译时链接和运行时链接分开，所以常常遇到这样奇怪的问题：
 
-- 在本机编译、链接；
-- 在本机不能运行：
+- 在本机编译、链接，在本机不能运行：
 
 ```Code
 ./myapp: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.33' not found (required by ./myapp)
@@ -120,9 +170,29 @@ GLIBCXX_2.33
 
 `/lib/x86_64-linux-gnu/libc.so.6` 中确实没有 `GLIBC_2.33` 的符号。
 
+
 如果你的系统中有多个 glibc ，那么这种问题可以通过上面“运行时 so 的加载顺序”，使用环境变量调整。
 
-最好的方式，是在编译时就确认 GCC 的 glibc 和系统运行时一致。
+但是，这种对 glibc 的依赖可能是间接的：
+
+```bash
+$ ls /path/to/gcc/v14.2.0/lib64 | grep libstdc++.so
+libstdc++.so
+libstdc++.so.6
+
+$ ldd /path/to/gcc/v14.2.0/lib64/libstdc++.so.6
+        linux-vdso.so.1 (0x00007ffd965f4000)
+        libm.so.6 => /usr/lib64/libm.so.6 (0x0000147a213a9000)
+        libc.so.6 => /usr/lib64/libc.so.6 (0x0000147a20fe4000)
+        /lib64/ld-linux-x86-64.so.2 (0x0000147a219ea000)
+        libgcc_s.so.1 => /path/to/gcc/v14.2.0/lib64/libgcc_s.so.1 (0x0000147a21be4000)
+```
+
+此时，如果你的编译和运行的机器不是同一台（意味着运行时 /usr/lib64/libc.so.6 的文件和编译期不一致），这时候就基本没有没有办法了。
+理论上，你可以下载一个与编译期相同的 libc.so.6 ，但是你无法保证系统的动态链接器 `/lib64/ld-linux-x86-64.so.2` 与所下载的 libc.so.6 兼容。
+而 `/lib64/ld-linux-x86-64.so.2` 路径是无法通过环境变量修改的，因为它是内核在程序启动时直接加载的，它的路径是硬编码在 ELF 可执行文件中的。
+
+所以最好的方式，是在编译时就确认 GCC 的 glibc 和系统运行时一致。
 
 ### 检查当前 GCC 使用的 glibc 路径
 
