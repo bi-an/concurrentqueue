@@ -66,6 +66,7 @@
 #else
 #include <atomic>		// Requires C++11. Sorry VS2010.
 #include <cassert>
+#include <mutex>        // used for thread exit synchronization
 #endif
 #include <cstddef>              // for max_align_t
 #include <cstdint>
@@ -77,7 +78,6 @@
 #include <climits>		// for CHAR_BIT
 #include <array>
 #include <thread>		// partly for __WINPTHREADS_VERSION if on MinGW-w64 w/ POSIX threading
-#include <mutex>        // used for thread exit synchronization
 
 // Platform-specific definitions of a numeric thread ID type and an invalid value
 namespace moodycamel { namespace details {
