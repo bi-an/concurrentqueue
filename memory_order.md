@@ -1,3 +1,15 @@
+## 参考资料
+
+- [std::memory_order](https://en.cppreference.com/w/cpp/atomic/memory_order.html) —— cppreference
+- [C++ Memory Model: Migrating from x86 to ARM](https://arangodb.com/2021/02/cpp-memory-model-migrating-from-x86-to-arm/)
+- [Memory Ordering (ARM Architecture)](https://developer.arm.com/documentation/102336/0100/Memory-ordering) —— ARM 官方文档
+- [Multithreading in C++: Memory Ordering](https://www.ramtintjb.com/blog/memory-ordering) —— Ramtin 的博客
+- [Understanding Atomics and Memory Ordering](https://dev.to/kprotty/understanding-atomics-and-memory-ordering-2mom) —— dev.to 博客 by kprotty
+
+## ChatGPT
+
+
+
 🔍 关键位置分析
 1. freeListHead.load(std::memory_order_acquire) in try_get
 目的：读取链表头指针，准备尝试获取一个节点。
