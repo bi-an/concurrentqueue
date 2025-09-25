@@ -6,6 +6,17 @@
 - [Multithreading in C++: Memory Ordering](https://www.ramtintjb.com/blog/memory-ordering) —— Ramtin 的博客
 - [Understanding Atomics and Memory Ordering](https://dev.to/kprotty/understanding-atomics-and-memory-ordering-2mom) —— dev.to 博客 by kprotty
 
+
+## 关键概念
+
+retire
+
+指令是乱序执行的（out-of-order execution），但必须按程序顺序提交结果。
+所以即使一条指令已经执行完毕，它也要等前面的指令都完成，才能“退休”。
+“退休”意味着这条指令的结果被正式写入寄存器或内存，成为程序状态的一部分。
+这样保证程序的语义一致性。
+
+
 ## ChatGPT
 
 
