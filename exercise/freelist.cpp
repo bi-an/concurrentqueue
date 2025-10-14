@@ -65,9 +65,11 @@ public:
             auto prevHead = head;
             // 先将 head 的引用计数加 1 。
             // refs=0 说明节点已经被摘下，且其他线程都放弃摘取。
-            // 不能无脑使用 fetch_add 增加，否则该摘下的节点 add() 回来的时候，可能永远无法等待到 refs=0
-            // ，导致永远无法成功 add()
-            if ((refs & REFS_MASK) == 0 || !head->freeListRefs.compare_exchange_strong(refs, refs + 1)) {
+            // 不能使用 fetch_add 无脑增加，否则该摘下的节点 add() 回来的时候，可能永远无法等待到 refs=0
+            // ，导致永远无法成功 add() 。
+            // acquire: 保证 if 中语句不会被提前执行（可能因为 CPU 预测而提前）
+            if ((refs & REFS_MASK) == 0 ||
+                !head->freeListRefs.compare_exchange_strong(refs, refs + 1, std::memory_order_acquire)) {
                 // 更新 head 继续尝试
                 head = freeListHead.load();
                 // refs 已经被 CAS 更新，无需再次更新
@@ -77,8 +79,10 @@ public:
             // 成功增加引用计数（可以防止 ABA），所以现在可以安心地 CAS(head, head->next)
             auto next = head->next.load(std::memory_order_relaxed);
             if (freeListHead.compare_exchange_strong(head, next)) {
-                // 成功摘下节点
-                // TODO: assert(refs)
+                // 成功摘下 head 节点
+                // 说明 head 在此之前必然在 freelist 上，所以它不可能游离于 freelist 外，更不可能在被其他线程 add()
+                // 回来的途中
+                assert((head->freeListRefs.load() & SHOULD_BE_ON_FREELIST) == 0);
                 // 减去当前线程增加的引用计数和 freelist 持有的引用计数
                 // release: 需要将前面的所有操作都完成且发布到其他线程
                 head->freeListRefs.fetch_sub(2, std::memory_order_release);
@@ -86,7 +90,7 @@ public:
                 return head;
             }
 
-            //  CAS 失败，被其他线程抢先摘取了
+            // CAS 失败，被其他线程抢先摘取了
             // 回退当前线程引入的引用计数（要使用暂存的 prevHead 来回退，因为上一步的 CAS 必定把 head 更新了）
             refs = prevHead->freeListRefs.fetch_sub(1);
             if (refs == SHOULD_BE_ON_FREELIST + 1) {
